@@ -1,0 +1,9 @@
+playbook_id: "deep_research"
+description: "Standard Deep Research Flow"
+nodes:
+  - id: "step_1"
+    tool: "mcp_browser_search"
+  - id: "step_2"
+    tool: "cognitive_analyzer"
+  - id: "step_3"
+    tool: "cognitive_summarizer"

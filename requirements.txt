@@ -1,0 +1,12 @@
+mcp
+langgraph
+pyyaml
+pydantic
+pydantic-settings
+llama-index
+qdrant-client
+neo4j
+redis
+psycopg2-binary
+asyncio
+httpx
