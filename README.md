@@ -56,6 +56,25 @@ Pintu akses tunggal ke dunia luar:
 
 ---
 
+## 🛠️ MCP Tool Registry (v2.0)
+
+SNO Server mengekspos 10 tools MCP untuk dioperasikan oleh AI Agent (seperti Hermes):
+
+| Nama Tool | Deskripsi | Input Utama |
+| :--- | :--- | :--- |
+| `sno_run_playbook` | Menjalankan playbook YAML secara asinkron di latar belakang. | `pb_id` (ID playbook), `query` (input awal) |
+| `sno_poll_status` | Memeriksa status eksekusi job (`pending`, `running`, `success`, `failed`, `cancelled`) dan mengambil hasil akhir. | `job_id` (8-karakter ID) |
+| `sno_cancel_job` | Membatalkan pekerjaan yang sedang berjalan di antrean. | `job_id` |
+| `sno_list_playbooks` | Menampilkan seluruh daftar playbook YAML yang tersedia di folder `playbooks/`. | (tanpa input) |
+| `sno_create_playbook` | Membuat playbook YAML baru secara dinamis menggunakan AI Planner. | `goal` (tujuan alur kerja), `context` (opsional) |
+| `sno_hybrid_query` | Melakukan query hibrida (pencarian semantik vektor Qdrant + relasi NetworkX/Neo4j). | `query` (pencarian teks), `top_k` |
+| `sno_memory_store` | Menyimpan potongan informasi/dokumen baru ke dalam Knowledge Nexus. | `content` (teks), `entity_name` (opsional), `tags` |
+| `sno_health_check` | Memeriksa konektivitas subsistem database, Redis, Qdrant, dan Neo4j. | (tanpa input) |
+| `sno_get_metrics` | Mengembalikan snapshot metrik performa eksekusi job (durasi, error, pemanggilan tool). | (tanpa input) |
+| `sno_call_external_agent` | Memproksi pemanggilan tool ke agen/server MCP eksternal lainnya. | `server_url`, `tool_name`, `args` |
+
+---
+
 ## 💻 SNO Ops Console (UI Interface)
 
 SNO dilengkapi dengan dashboard manajemen berbasis **Streamlit** untuk memberikan observabilitas penuh bagi operator manusia:
@@ -63,6 +82,7 @@ SNO dilengkapi dengan dashboard manajemen berbasis **Streamlit** untuk memberika
 - 🚀 **Job Monitor**: Pantau status eksekusi `job_id` secara real-time, lihat progress, dan ambil hasil akhir.
 - 📜 **Playbook Manager**: Editor visual untuk mengubah logika YAML Playbook tanpa perlu restart server.
 - 🧠 **Nexus Explorer**: Interface untuk memverifikasi data di dalam memori hybrid (Semantic & Relational).
+- 📊 **Metrics & Prometheus**: Snapshot metrik kegagalan, volume request, durasi job (p50/p95/p99) yang dapat diintegrasikan dengan Grafana.
 - 📋 **System Logs**: Audit trail lengkap untuk debugging eksekusi agen.
 
 ---
@@ -72,8 +92,7 @@ SNO dilengkapi dengan dashboard manajemen berbasis **Streamlit** untuk memberika
 ### Prasyarat
 - Python 3.11+
 - Redis (untuk antrean tugas)
-- PostgreSQL (untuk persistensi state)
-- Qdrant/Neo4j (untuk Knowledge Nexus)
+- Qdrant & Neo4j (opsional - cadangan NetworkX/In-memory aktif otomatis jika mati)
 
 ### Instalasi
 ```bash
@@ -82,6 +101,31 @@ cd sovereign-nexus-orchestrator
 pip install -r requirements.txt
 cp .env.example .env
 ```
+
+### ⚙️ Konfigurasi `.env`
+
+Lengkapi konfigurasi keamanan, kecerdasan AI, dan pemantauan sistem di berkas `.env` Anda:
+
+```env
+# Keamanan (Security)
+ENABLE_AUTH=true                     # Aktifkan autentikasi API Key
+SNO_API_KEY=rahasia-api-key          # Kunci API bersama untuk client
+
+# AI Planner (LLM)
+DEFAULT_LLM_PROVIDER=openai          # 'openai' atau 'anthropic'
+DEFAULT_LLM_MODEL=gpt-4o-mini
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-...
+
+# Pemantauan (Metrics)
+ENABLE_METRICS=true                  # Aktifkan metrik endpoint /metrics
+METRICS_PORT=9090                    # Port server metrik Prometheus
+
+# Subsistem DB & Antrean
+DATABASE_URL=sqlite:///./data/sno_state.db
+REDIS_URL=redis://localhost:6379/0
+```
+
 
 ### Menjalankan Sistem
 SNO berjalan dengan dua komponen utama:

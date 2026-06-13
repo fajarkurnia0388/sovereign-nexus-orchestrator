@@ -1,43 +1,76 @@
 """
-SNO Ops Console — Streamlit Dashboard
---------------------------------------
-Management UI for the Sovereign Nexus Orchestrator.
+SNO Ops Console — v2.0
 
-FIX (Async): Python 3.10+ deprecates asyncio.get_event_loop() when there is
-no running loop; Python 3.12 raises RuntimeError.  Streamlit runs in its own
-thread with its own event loop, which conflicts with asyncio.run().
+Production-grade Streamlit dashboard for monitoring and managing the
+Sovereign Nexus Orchestrator in real-time.
 
-Solution: apply nest_asyncio once at startup so nested event-loop calls are
-allowed, then use asyncio.get_event_loop().run_until_complete() consistently.
+Tabs:
+  1. 🚀 Job Monitor      — Submit jobs, poll status, view results in real-time.
+  2. 📜 Playbook Manager — List, view, edit, and create playbooks.
+  3. 🧠 Nexus Explorer   — Query the hybrid knowledge store.
+  4. 📊 Metrics           — Live operational metrics and health status.
+  5. 📋 System Logs      — Tail the SNO log stream.
 
-FIX (Imports): Moved `import pandas as pd` from inside an if-block to module
-level, which is required for proper linting and avoids repeated import costs.
+Bug Fixes from v1.x:
+  - ISU-5: Async in Streamlit fixed via nest_asyncio.apply() at startup.
+  - ISU-8: All imports moved to module level (no imports inside if-blocks).
 """
-import asyncio
-import logging
-import os
-import uuid
+from __future__ import annotations
 
-import nest_asyncio          # Must be applied before any asyncio usage
-import pandas as pd           # FIX: was imported inside an if-block
+import asyncio
+import json
+import time
+from pathlib import Path
+
+import nest_asyncio
+import pandas as pd
 import streamlit as st
 import yaml
 
-from src.core.engine import PlaybookCompiler, SNOExecutor
-from src.mcp.registry import TOOL_REGISTRY
-from src.memory.nexus import nexus
-from src.utils.logger import setup_logging
-
-# ── Apply nest_asyncio once ───────────────────────────────────────────────────
-# This patches asyncio to allow nested event-loop calls, which Streamlit requires.
+# Patch the event loop BEFORE importing any async code — ISU-5 FIX
 nest_asyncio.apply()
 
-setup_logging()
-logger = logging.getLogger(__name__)
+from src.config import settings
+from src.core.engine import SNOExecutor
+from src.core.planner import AIPlaybookPlanner
+from src.memory.nexus import KnowledgeNexus
+from src.monitoring.metrics import metrics
+from src.utils.logger import get_logger, setup_logging
 
-# ─────────────────────────────────────────────────────────────
-# Page Config
-# ─────────────────────────────────────────────────────────────
+# ── Logging Setup ─────────────────────────────────────────────────────────────
+setup_logging(level=settings.log_level, fmt=settings.log_format)
+logger = get_logger("ui.app")
+
+
+# ── Async helper ──────────────────────────────────────────────────────────────
+
+def run_async(coro):
+    """Run a coroutine synchronously inside Streamlit's event loop."""
+    return asyncio.get_event_loop().run_until_complete(coro)
+
+
+# ── Cached singletons ─────────────────────────────────────────────────────────
+
+@st.cache_resource
+def get_executor() -> SNOExecutor:
+    return SNOExecutor(
+        playbooks_dir=settings.playbooks_dir,
+        db_path=settings.db_path,
+    )
+
+
+@st.cache_resource
+def get_nexus() -> KnowledgeNexus:
+    return KnowledgeNexus()
+
+
+@st.cache_resource
+def get_planner() -> AIPlaybookPlanner:
+    return AIPlaybookPlanner(playbooks_dir=settings.playbooks_dir)
+
+
+# ── Page Config ───────────────────────────────────────────────────────────────
+
 st.set_page_config(
     page_title="SNO Ops Console",
     page_icon="🌌",
@@ -45,160 +78,307 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ─────────────────────────────────────────────────────────────
-# Session State (persists across Streamlit reruns)
-# ─────────────────────────────────────────────────────────────
-if "executor" not in st.session_state:
-    st.session_state.executor = SNOExecutor()
-if "compiler" not in st.session_state:
-    st.session_state.compiler = PlaybookCompiler(TOOL_REGISTRY)
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 
-executor: SNOExecutor = st.session_state.executor
-compiler: PlaybookCompiler = st.session_state.compiler
+with st.sidebar:
+    st.markdown("# 🌌 SNO Ops Console")
+    st.caption(f"Sovereign Nexus Orchestrator **v{settings.sno_version}**")
+    st.caption(f"Env: `{settings.sno_env}`")
+    st.divider()
 
+    auto_refresh = st.toggle("⚡ Auto-refresh (2s)", value=False)
+    if auto_refresh:
+        time.sleep(settings.ui_refresh_interval_ms / 1000)
+        st.rerun()
 
-# ─────────────────────────────────────────────────────────────
-# Async Helper
-# ─────────────────────────────────────────────────────────────
+    st.divider()
+    executor = get_executor()
+    all_jobs_list = executor.get_all_jobs(limit=100)
+    active_jobs_count = sum(1 for j in all_jobs_list if j["status"] == "running")
+    uptime_s = int(time.time() - metrics._start_time)
 
-def run_async(coro):
-    """
-    Run an async coroutine from synchronous Streamlit code.
-
-    FIX: The original code used asyncio.get_event_loop() which raises
-    DeprecationWarning (Python 3.10+) or RuntimeError (Python 3.12+) when
-    no loop is set on the current thread.
-
-    After nest_asyncio.apply(), asyncio.get_event_loop() returns a valid
-    (possibly already-running) loop that supports nested calls.
-    """
-    loop = asyncio.get_event_loop()
-    return loop.run_until_complete(coro)
+    col1, col2 = st.columns(2)
+    col1.metric("Active Jobs", active_jobs_count)
+    col2.metric("Uptime", f'{uptime_s}s')
 
 
-# ─────────────────────────────────────────────────────────────
-# Sidebar Navigation
-# ─────────────────────────────────────────────────────────────
-st.title("🌌 SNO Ops Console")
-st.markdown("**Sovereign Nexus Orchestrator** — Management Dashboard")
+# ── Main Tabs ─────────────────────────────────────────────────────────────────
 
-menu = st.sidebar.selectbox(
-    "Navigation",
-    ["Dashboard", "Playbook Manager", "Knowledge Nexus", "System Logs"],
-)
-st.sidebar.caption(f"SNO · Session jobs: {len(executor.jobs)}")
+tab_jobs, tab_playbooks, tab_nexus, tab_metrics, tab_logs = st.tabs([
+    "🚀 Job Monitor",
+    "📜 Playbook Manager",
+    "🧠 Nexus Explorer",
+    "📊 Metrics",
+    "📋 System Logs",
+])
 
 
-# ─────────────────────────────────────────────────────────────
-# Dashboard
-# ─────────────────────────────────────────────────────────────
-if menu == "Dashboard":
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — JOB MONITOR
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab_jobs:
     st.header("🚀 Job Monitor")
+    executor = get_executor()
 
-    with st.expander("▶ Trigger a New Playbook", expanded=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            pb_name = st.text_input("Playbook ID", value="deep_research",
-                                    help="Must match a YAML file in the playbooks/ directory.")
-        with col2:
-            query = st.text_input("Query / Input", value="AI Agents 2026")
+    col_submit, col_status = st.columns([1, 1])
 
-        if st.button("Execute Playbook", type="primary"):
-            yaml_path = f"playbooks/{pb_name}.yaml"
-            if not os.path.exists(yaml_path):
-                st.error(f"Playbook file not found: {yaml_path}")
+    with col_submit:
+        st.subheader("Submit New Job")
+        playbooks = executor.list_playbooks()
+        pb_options = [pb["id"] for pb in playbooks] if playbooks else ["(no playbooks found)"]
+
+        with st.form("submit_job_form"):
+            selected_pb = st.selectbox("Playbook", pb_options)
+            query = st.text_area("Query / Goal", placeholder="What do you want to accomplish?", height=100)
+            submitted = st.form_submit_button("▶ Run Job", type="primary")
+
+        if submitted and query and selected_pb != "(no playbooks found)":
+            try:
+                job_id = executor.submit_job(selected_pb, query)
+                metrics.record_job_start(selected_pb)
+                st.success(f"✅ Job submitted! ID: `{job_id}`")
+                st.session_state["last_job_id"] = job_id
+            except FileNotFoundError as exc:
+                st.error(f"❌ {exc}")
+            except Exception as exc:
+                st.error(f"❌ Error: {exc}")
+
+    with col_status:
+        st.subheader("Poll Job Status")
+        job_id_input = st.text_input(
+            "Job ID",
+            value=st.session_state.get("last_job_id", ""),
+            placeholder="e.g. a1b2c3d4",
+            max_chars=8,
+        )
+        col_poll, col_cancel = st.columns([1, 1])
+        poll_clicked = col_poll.button("🔍 Poll Status", use_container_width=True)
+        cancel_clicked = col_cancel.button("🛑 Cancel Job", type="secondary", use_container_width=True)
+
+        if poll_clicked and job_id_input:
+            record = executor.get_job(job_id_input.strip())
+            if not record:
+                st.warning(f"Job `{job_id_input}` not found.")
             else:
-                try:
-                    with open(yaml_path, "r", encoding="utf-8") as f:
-                        yaml_config = f.read()
-                    graph = compiler.compile(yaml_config)
-                    job_id = str(uuid.uuid4())[:8]
-                    executor.jobs[job_id] = {"status": "queued", "result": None}
-                    run_async(executor.run_job(job_id, graph, query))
-                    st.success(f"✅ Job completed! ID: **{job_id}**")
-                except Exception as exc:
-                    st.error(f"❌ Execution failed: {exc}")
-                    logger.exception("Playbook execution failed in UI.")
+                data = record.to_dict()
+                status_icon = {
+                    "pending": "⏳", "running": "🔄",
+                    "success": "✅", "failed": "❌", "cancelled": "🚫",
+                }.get(data["status"], "❓")
+                st.markdown(f"**Status:** {status_icon} `{data['status'].upper()}`")
+                if data.get("duration_seconds"):
+                    st.markdown(f"**Duration:** {data['duration_seconds']}s")
+                st.markdown(f"**Progress:** {data.get('progress', 'N/A')}")
+                if data["status"] == "success":
+                    st.success("**Result:**")
+                    st.text(data.get("result", ""))
+                elif data["status"] == "failed":
+                    st.error(f"**Error:** {data.get('error', '')}")
+                with st.expander("Full Job Record"):
+                    st.json(data)
 
-    st.subheader("Job History")
-    if not executor.jobs:
-        st.info("No jobs yet.  Trigger a playbook above.")
+        if cancel_clicked and job_id_input:
+            cancelled = executor.cancel_job(job_id_input.strip())
+            if cancelled:
+                st.warning(f"⚡ Cancellation requested for `{job_id_input}`")
+            else:
+                st.info("Job not running or not found.")
+
+    st.divider()
+    st.subheader("📋 All Jobs")
+    all_jobs = executor.get_all_jobs(limit=50)
+    if all_jobs:
+        df = pd.DataFrame(all_jobs)[["job_id", "playbook_id", "status", "created_at", "duration_seconds", "progress"]]
+        st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        # FIX: pandas is now imported at module level
-        df = (
-            pd.DataFrame.from_dict(executor.jobs, orient="index")
-            .reset_index()
-            .rename(columns={"index": "JobID"})
-        )
-        st.dataframe(df, use_container_width=True)
+        st.info("No jobs yet. Submit one above! 👆")
 
 
-# ─────────────────────────────────────────────────────────────
-# Playbook Manager
-# ─────────────────────────────────────────────────────────────
-elif menu == "Playbook Manager":
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — PLAYBOOK MANAGER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab_playbooks:
     st.header("📜 Playbook Manager")
+    executor = get_executor()
+    planner = get_planner()
 
-    playbooks_dir = "playbooks"
-    if not os.path.isdir(playbooks_dir):
-        st.warning(f"Playbooks directory not found: '{playbooks_dir}'")
-    else:
-        pb_files = [f for f in os.listdir(playbooks_dir) if f.endswith(".yaml")]
-        if not pb_files:
-            st.info("No playbooks found.  Add .yaml files to the playbooks/ directory.")
+    col_list, col_editor = st.columns([1, 2])
+
+    with col_list:
+        st.subheader("Available Playbooks")
+        playbooks = executor.list_playbooks()
+        if playbooks:
+            for pb in playbooks:
+                with st.expander(f"**{pb['name']}** `v{pb['version']}`"):
+                    st.write(pb.get("description", ""))
+                    st.caption(f"ID: `{pb['id']}` | Nodes: {pb['node_count']}")
         else:
-            selected_pb = st.selectbox("Select Playbook", pb_files)
-            if selected_pb:
-                path = os.path.join(playbooks_dir, selected_pb)
-                with open(path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                new_content = st.text_area("Edit Playbook YAML", value=content, height=400)
+            st.info("No playbooks found in `./playbooks/`.")
 
-                col_save, col_validate = st.columns([1, 1])
-                with col_validate:
-                    if st.button("Validate YAML"):
-                        try:
-                            yaml.safe_load(new_content)
-                            st.success("✅ YAML is valid.")
-                        except yaml.YAMLError as exc:
-                            st.error(f"❌ YAML error: {exc}")
-                with col_save:
-                    if st.button("Save Playbook", type="primary"):
-                        with open(path, "w", encoding="utf-8") as f:
-                            f.write(new_content)
-                        st.success("Playbook saved.")
+    with col_editor:
+        st.subheader("✨ AI Playbook Generator")
+        with st.form("generate_pb_form"):
+            goal = st.text_area(
+                "Describe your goal",
+                placeholder="e.g. Research the top 5 Python async web frameworks, "
+                "compare their performance, stars, and maturity, then produce a summary report.",
+                height=120,
+            )
+            ctx = st.text_input("Additional context (optional)")
+            provider = st.selectbox("LLM Provider", ["openai", "anthropic"], index=0)
+            gen_btn = st.form_submit_button("🪄 Generate Playbook", type="primary")
+
+        if gen_btn and goal:
+            with st.spinner("Calling AI Planner…"):
+                try:
+                    result = run_async(planner.generate(goal=goal, context=ctx, provider=provider, save=True))
+                    if result["validated"]:
+                        st.success(f"✅ Playbook `{result['playbook_id']}` generated! ({result['node_count']} nodes)")
+                        st.code(result["yaml_content"], language="yaml")
+                    else:
+                        st.warning("⚠️ Playbook generated but failed schema validation. Review below:")
+                        st.code(result["yaml_content"], language="yaml")
+                except Exception as exc:
+                    st.error(f"❌ Generation failed: {exc}")
+
+        st.divider()
+        st.subheader("📝 View / Edit YAML")
+        pb_dir = Path(settings.playbooks_dir)
+        yaml_files = list(pb_dir.glob("*.yaml"))
+        if yaml_files:
+            chosen = st.selectbox("Select playbook file", [f.name for f in yaml_files])
+            chosen_path = pb_dir / chosen
+            current_content = chosen_path.read_text(encoding="utf-8")
+            edited = st.text_area("YAML Content", value=current_content, height=300)
+            if st.button("💾 Save Changes"):
+                try:
+                    yaml.safe_load(edited)  # Validate before saving
+                    chosen_path.write_text(edited, encoding="utf-8")
+                    st.success(f"✅ Saved `{chosen}`")
+                except yaml.YAMLError as exc:
+                    st.error(f"❌ Invalid YAML: {exc}")
+        else:
+            st.info("No YAML files found. Use the generator above.")
 
 
-# ─────────────────────────────────────────────────────────────
-# Knowledge Nexus Explorer
-# ─────────────────────────────────────────────────────────────
-elif menu == "Knowledge Nexus":
-    st.header("🧠 Knowledge Nexus Explorer")
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — NEXUS EXPLORER
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    query = st.text_input("Search hybrid memory", placeholder="e.g. SNO, Hermes, LangGraph…")
-    if query:
-        with st.spinner("Searching…"):
-            res = run_async(nexus.hybrid_query(query))
-        col1, col2 = st.columns(2)
-        with col1:
-            st.info(f"**Semantic**\n\n{res['semantic']}")
-        with col2:
-            relations = "\n".join(res["relational"]) if res["relational"] else "No relations found."
-            st.info(f"**Relations**\n\n{relations}")
+with tab_nexus:
+    st.header("🧠 Nexus Explorer")
+    nexus = get_nexus()
+
+    col_query, col_store = st.columns([1, 1])
+
+    with col_query:
+        st.subheader("Query Knowledge")
+        nq = st.text_input("Search Query", placeholder="e.g. async Python frameworks")
+        top_k = st.slider("Max results", 1, 20, 5)
+        if st.button("🔍 Search", use_container_width=True):
+            with st.spinner("Querying Nexus…"):
+                result = run_async(nexus.query(nq, top_k=top_k))
+                st.json(result)
+
+    with col_store:
+        st.subheader("Store Knowledge")
+        store_content = st.text_area("Content", placeholder="Knowledge to store…", height=100)
+        store_entity = st.text_input("Entity Name (optional)", placeholder="e.g. FastAPI")
+        store_tags = st.text_input("Tags (comma-separated)", placeholder="python, async, web")
+        if st.button("💾 Store in Nexus", use_container_width=True):
+            if store_content:
+                tags = [t.strip() for t in store_tags.split(",") if t.strip()]
+                result = run_async(nexus.store(
+                    content=store_content,
+                    tags=tags,
+                    entity_name=store_entity,
+                ))
+                st.success(f"✅ Stored! Doc ID: `{result['doc_id']}`")
+            else:
+                st.warning("Enter content to store.")
+
+    st.divider()
+    st.subheader("Health Check")
+    if st.button("🏥 Check Nexus Health"):
+        with st.spinner("…"):
+            health = run_async(nexus.health_check())
+            st.json(health)
 
 
-# ─────────────────────────────────────────────────────────────
-# System Logs
-# ─────────────────────────────────────────────────────────────
-elif menu == "System Logs":
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — METRICS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab_metrics:
+    st.header("📊 Operational Metrics")
+
+    snapshot = metrics.snapshot()
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Uptime", f"{int(snapshot['uptime_seconds'])}s")
+    col2.metric("Active Jobs", int(snapshot["active_jobs"]))
+    col3.metric("MCP Requests", sum(snapshot["mcp_requests_total"].values()) if snapshot["mcp_requests_total"] else 0)
+    col4.metric("Errors", sum(snapshot["errors_total"].values()) if snapshot["errors_total"] else 0)
+
+    st.divider()
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.subheader("Job Duration Distribution")
+        dur = snapshot["job_duration"]
+        if dur["count"] > 0:
+            st.write(f"- Count: {dur['count']}")
+            st.write(f"- p50: {dur['p50']}s")
+            st.write(f"- p95: {dur['p95']}s")
+            st.write(f"- p99: {dur['p99']}s")
+            st.write(f"- Total: {dur['sum']}s")
+        else:
+            st.info("No jobs completed yet.")
+
+    with col_b:
+        st.subheader("MCP Requests by Tool")
+        mcp_data = snapshot.get("mcp_requests_total", {})
+        if mcp_data:
+            df_mcp = pd.DataFrame(
+                [(k.replace("('", "").replace("',)", ""), v) for k, v in mcp_data.items()],
+                columns=["tool", "count"]
+            ).sort_values("count", ascending=False)
+            st.dataframe(df_mcp, use_container_width=True, hide_index=True)
+        else:
+            st.info("No MCP requests recorded yet.")
+
+    st.divider()
+    with st.expander("📋 Full Metrics Snapshot (JSON)"):
+        st.json(snapshot)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — SYSTEM LOGS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab_logs:
     st.header("📋 System Logs")
-    st.caption("Live log streaming is a production feature.  Showing static audit summary.")
-    log_text = (
-        f"SNO Ops Console started.\n"
-        f"Active jobs in session: {len(executor.jobs)}\n"
-        + "\n".join(
-            f"  [{jid}] status={info['status']}" for jid, info in executor.jobs.items()
-        )
-        or "  (none)"
+    st.info(
+        "ℹ️ Live log streaming is available when running with Docker. "
+        "SNO logs are written to stdout and can be tailed with `docker logs -f sno-mcp`."
     )
-    st.text_area("Audit Log", value=log_text, height=500, disabled=True)
+
+    log_dir = Path("logs")
+    log_files = list(log_dir.glob("*.log")) if log_dir.exists() else []
+
+    if log_files:
+        chosen_log = st.selectbox("Log file", [f.name for f in log_files])
+        log_path = log_dir / chosen_log
+        content = log_path.read_text(encoding="utf-8")
+        lines = content.splitlines()[-settings.ui_max_log_lines:]
+        st.code("\n".join(lines), language="text")
+    else:
+        st.code(
+            "# No log files found.\n"
+            "# Enable file logging by setting LOG_FILE_PATH in .env\n"
+            "# or use: docker logs -f sno-mcp",
+            language="bash",
+        )
