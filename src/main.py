@@ -29,7 +29,7 @@ def main() -> None:
 
     logger = get_logger("main")
     logger.info(
-        f"🌌 Starting Sovereign Nexus Orchestrator v{settings.sno_version} "
+        f"[SNO] Starting Sovereign Nexus Orchestrator v{settings.sno_version} "
         f"[env={settings.sno_env}]"
     )
 

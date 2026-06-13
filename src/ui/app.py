@@ -104,12 +104,13 @@ with st.sidebar:
 
 # ── Main Tabs ─────────────────────────────────────────────────────────────────
 
-tab_jobs, tab_playbooks, tab_nexus, tab_metrics, tab_logs = st.tabs([
+tab_jobs, tab_playbooks, tab_nexus, tab_metrics, tab_logs, tab_subagents = st.tabs([
     "🚀 Job Monitor",
     "📜 Playbook Manager",
     "🧠 Nexus Explorer",
     "📊 Metrics",
     "📋 System Logs",
+    "🔌 Sub-Agent Manager",
 ])
 
 
@@ -382,3 +383,111 @@ with tab_logs:
             "# or use: docker logs -f sno-mcp",
             language="bash",
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — SUB-AGENT MANAGER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab_subagents:
+    st.header("🔌 Sub-Agent Manager")
+    st.caption("Manage external sub-agent endpoints and API keys dynamically. Outgoing calls via the SNO MCP Bridge will automatically lookup and inject credentials.")
+
+    import sqlite3
+    
+    # ── Database actions ──
+    def get_sub_agents():
+        conn = sqlite3.connect(settings.db_path)
+        try:
+            with conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS sno_sub_agents (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        endpoint TEXT UNIQUE NOT NULL,
+                        api_key TEXT,
+                        created_at REAL NOT NULL
+                    )
+                """)
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, name, endpoint, api_key, created_at FROM sno_sub_agents ORDER BY created_at DESC")
+                return cursor.fetchall()
+        except Exception as e:
+            st.error(f"Failed to fetch sub-agents: {e}")
+            return []
+        finally:
+            conn.close()
+
+    def add_sub_agent(name, endpoint, api_key):
+        conn = sqlite3.connect(settings.db_path)
+        try:
+            with conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS sno_sub_agents (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        endpoint TEXT UNIQUE NOT NULL,
+                        api_key TEXT,
+                        created_at REAL NOT NULL
+                    )
+                """)
+                conn.execute(
+                    "INSERT INTO sno_sub_agents (name, endpoint, api_key, created_at) VALUES (?, ?, ?, ?)",
+                    (name, endpoint, api_key, time.time())
+                )
+            st.success(f"✅ Sub-agent '{name}' successfully registered!")
+        except sqlite3.IntegrityError:
+            st.error(f"❌ A sub-agent with endpoint '{endpoint}' is already registered.")
+        except Exception as e:
+            st.error(f"Failed to add sub-agent: {e}")
+        finally:
+            conn.close()
+
+    def delete_sub_agent(agent_id):
+        conn = sqlite3.connect(settings.db_path)
+        try:
+            with conn:
+                conn.execute("DELETE FROM sno_sub_agents WHERE id = ?", (agent_id,))
+            st.success("✅ Sub-agent deleted.")
+        except Exception as e:
+            st.error(f"Failed to delete sub-agent: {e}")
+        finally:
+            conn.close()
+
+    col_add, col_list = st.columns([1, 2])
+
+    with col_add:
+        st.subheader("Add External Sub-Agent")
+        with st.form("add_sub_agent_form", clear_on_submit=True):
+            agent_name = st.text_input("Agent Name", placeholder="e.g. BrowserAgent")
+            agent_endpoint = st.text_input("Endpoint URL", placeholder="e.g. http://localhost:8001")
+            agent_key = st.text_input("API Key / Bearer Token", type="password", placeholder="e.g. test-mcp-key-xyz")
+            submit_add = st.form_submit_button("🔌 Register Sub-Agent", type="primary")
+
+        if submit_add:
+            if not agent_name or not agent_endpoint:
+                st.warning("⚠️ Name and Endpoint URL are required.")
+            else:
+                add_sub_agent(agent_name, agent_endpoint, agent_key)
+                st.rerun()
+
+    with col_list:
+        st.subheader("Registered Sub-Agents")
+        agents = get_sub_agents()
+        if agents:
+            for agent_id, name, endpoint, api_key, created_at in agents:
+                with st.expander(f"🔌 **{name}**"):
+                    st.markdown(f"**Endpoint:** `{endpoint}`")
+                    if api_key:
+                        masked_key = api_key[:4] + "*" * (len(api_key) - 4) if len(api_key) > 4 else "****"
+                        st.markdown(f"**API Key:** `{masked_key}`")
+                    else:
+                        st.markdown("**API Key:** *None*")
+                    
+                    st.caption(f"Registered on: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(created_at))}")
+                    if st.button("🗑️ Delete Agent", key=f"del_{agent_id}"):
+                        delete_sub_agent(agent_id)
+                        st.rerun()
+        else:
+            st.info("No external sub-agents registered yet. Use the form on the left to add one.")
+

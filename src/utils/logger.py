@@ -32,7 +32,7 @@ class _TextFormatter(logging.Formatter):
             extra = f" [job={record.job_id}]"
         if hasattr(record, "playbook"):
             extra += f" [pb={record.playbook}]"
-        return f"{ts} {prefix} {record.name}{extra}: {self.formatMessage(record)}"
+        return f"{ts} {prefix} {record.name}{extra}: {record.getMessage()}"
 
 
 class _JsonFormatter(logging.Formatter):
@@ -43,7 +43,7 @@ class _JsonFormatter(logging.Formatter):
             "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "msg": self.formatMessage(record),
+            "msg": record.getMessage(),
         }
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
