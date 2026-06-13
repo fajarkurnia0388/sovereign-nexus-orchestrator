@@ -77,7 +77,7 @@ SNO dilengkapi dengan dashboard manajemen berbasis **Streamlit** untuk memberika
 
 ### Instalasi
 ```bash
-git clone https://github.com/your-username/sovereign-nexus-orchestrator.git
+git clone https://github.com/fajarkurnia0388/sovereign-nexus-orchestrator.git
 cd sovereign-nexus-orchestrator
 pip install -r requirements.txt
 cp .env.example .env
