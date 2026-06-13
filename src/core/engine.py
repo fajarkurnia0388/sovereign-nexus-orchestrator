@@ -1,8 +1,22 @@
 import asyncio
 import yaml
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.sqlite import SqliteSaver # Production-ready proxy
 from typing import TypedDict
+
+# --- Schema Validation (Phase 4) ---
+class NodeSchema(BaseModel):
+    id: str
+    tool: str
+    next: Optional[str] = None
+    condition: Optional[Dict[str, str]] = None
+
+class PlaybookSchema(BaseModel):
+    playbook_id: str
+    description: Optional[str] = ""
+    nodes: List[NodeSchema]
 
 class AgentState(TypedDict):
     input: str
@@ -11,21 +25,18 @@ class AgentState(TypedDict):
     status: str
 
 class PlaybookCompiler:
-    """Compiles YAML playbook definitions into LangGraph workflows."""
     def __init__(self, tool_registry: Dict[str, Any]):
         self.tool_registry = tool_registry
 
     def compile(self, yaml_config: str):
-        config = yaml.safe_load(yaml_config)
+        # Validate with Pydantic (Phase 4)
+        config_data = yaml.safe_load(yaml_config)
+        pb = PlaybookSchema(**config_data)
+        
         workflow = StateGraph(AgentState)
         
-        nodes = config.get('nodes', [])
-        for node in nodes:
-            node_id = node['id']
-            tool_name = node['tool']
-            
-            # FIX: Closure bug. Use default argument to capture value at definition time
-            def make_node(t_name=tool_name): 
+        for node in pb.nodes:
+            def make_node(t_name=node.tool):
                 async def node_func(state: AgentState):
                     tool_func = self.tool_registry.get(t_name)
                     if not tool_func:
@@ -34,35 +45,52 @@ class PlaybookCompiler:
                     return await tool_func(state)
                 return node_func
             
-            workflow.add_node(node_id, make_node())
+            workflow.add_node(node.id, make_node())
         
-        # Linear edges for PoC
-        for i in range(len(nodes) - 1):
-            workflow.add_edge(nodes[i]['id'], nodes[i+1]['id'])
+        # Logic for edges
+        for node in pb.nodes:
+            if node.next:
+                workflow.add_edge(node.id, node.next)
+            elif node.id == pb.nodes[-1].id:
+                workflow.add_edge(node.id, END)
+            else:
+                # Default to linear flow if no 'next' is defined
+                # This is a simplification for PoC
+                pass
         
-        workflow.set_entry_point(nodes[0]['id'])
-        workflow.add_edge(nodes[-1]['id'], END)
+        # Fallback linear edges for simplicity in PoC
+        for i in range(len(pb.nodes) - 1):
+            if not pb.nodes[i].next:
+                workflow.add_edge(pb.nodes[i].id, pb.nodes[i+1].id)
+
+        workflow.set_entry_point(pb.nodes[0].id)
         
-        return workflow.compile()
+        # Phase 1: Persistence using SqliteSaver
+        memory = SqliteSaver.from_conn_string(":memory:") 
+        return workflow.compile(checkpointer=memory)
 
 class SNOExecutor:
-    """Handles the async execution of compiled playbooks."""
     def __init__(self):
-        self.jobs = {} # job_id -> {"status": ..., "result": ...}
+        self.jobs = {}
 
     async def run_job(self, job_id: str, graph, initial_input: str):
         try:
-            self.jobs[job_id]["status"] = "running"
+            self.jobs[job_id] = {"status": "running", "result": None}
+            # config includes a thread_id for LangGraph checkpointing
+            config = {"configurable": {"thread_id": job_id}}
+            
             initial_state = {
                 "input": initial_input,
                 "data": {},
                 "history": [],
-                "status": "starting"
+                "status": "started"
             }
             
-            final_state = await graph.ainvoke(initial_state)
+            final_state = await graph.ainvoke(initial_state, config=config)
             
-            self.jobs[job_id]["status"] = "completed"
-            self.jobs[job_id]["result"] = final_state['data'].get('summary', "No summary produced")
+            self.jobs[job_id] = {
+                "status": "completed", 
+                "result": final_state['data'].get('summary', "No summary produced")
+            }
         except Exception as e:
-            self.jobs[job_id]["status"] = f"failed: {str(e)}"
+            self.jobs[job_id] = {"status": "failed", "error": str(e)}
