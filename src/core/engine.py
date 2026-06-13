@@ -3,10 +3,10 @@ import yaml
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.sqlite import SqliteSaver # Production-ready proxy
+from langgraph.checkpoint.sqlite import SqliteSaver 
 from typing import TypedDict
+from src.config import settings
 
-# --- Schema Validation (Phase 4) ---
 class NodeSchema(BaseModel):
     id: str
     tool: str
@@ -29,14 +29,13 @@ class PlaybookCompiler:
         self.tool_registry = tool_registry
 
     def compile(self, yaml_config: str):
-        # Validate with Pydantic (Phase 4)
         config_data = yaml.safe_load(yaml_config)
         pb = PlaybookSchema(**config_data)
         
         workflow = StateGraph(AgentState)
         
         for node in pb.nodes:
-            def make_node(t_name=node.tool):
+            def make_node(t_name=node.tool): # Fix: Closure capture
                 async def node_func(state: AgentState):
                     tool_func = self.tool_registry.get(t_name)
                     if not tool_func:
@@ -47,26 +46,24 @@ class PlaybookCompiler:
             
             workflow.add_node(node.id, make_node())
         
-        # Logic for edges
+        # Edges logic
         for node in pb.nodes:
             if node.next:
                 workflow.add_edge(node.id, node.next)
             elif node.id == pb.nodes[-1].id:
                 workflow.add_edge(node.id, END)
-            else:
-                # Default to linear flow if no 'next' is defined
-                # This is a simplification for PoC
-                pass
         
-        # Fallback linear edges for simplicity in PoC
+        # Fallback linear edges
         for i in range(len(pb.nodes) - 1):
             if not pb.nodes[i].next:
                 workflow.add_edge(pb.nodes[i].id, pb.nodes[i+1].id)
 
         workflow.set_entry_point(pb.nodes[0].id)
         
-        # Phase 1: Persistence using SqliteSaver
-        memory = SqliteSaver.from_conn_string(":memory:") 
+        # FIX: Real Persistence using settings.DATABASE_URL
+        # Remove 'sqlite:///' for SqliteSaver
+        db_path = settings.DATABASE_URL.replace("sqlite:///", "")
+        memory = SqliteSaver.from_conn_string(db_path) 
         return workflow.compile(checkpointer=memory)
 
 class SNOExecutor:
@@ -76,7 +73,7 @@ class SNOExecutor:
     async def run_job(self, job_id: str, graph, initial_input: str):
         try:
             self.jobs[job_id] = {"status": "running", "result": None}
-            # config includes a thread_id for LangGraph checkpointing
+            # Use thread_id for LangGraph persistence
             config = {"configurable": {"thread_id": job_id}}
             
             initial_state = {

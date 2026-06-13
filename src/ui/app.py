@@ -23,6 +23,7 @@ st.markdown("### Sovereign Nexus Orchestrator Management Dashboard")
 menu = st.sidebar.selectbox("Navigation", ["Dashboard", "Playbook Manager", "Knowledge Nexus", "System Logs"])
 
 def run_async(coro):
+    """Helper to run async functions in Streamlit without blocking the loop."""
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
@@ -72,8 +73,8 @@ elif menu == "Knowledge Nexus":
     st.header("🧠 Knowledge Nexus Explorer")
     query = st.text_input("Search Hybrid Memory")
     if query:
-        # Now using the real Nexus logic
-        res = asyncio.run(nexus.hybrid_query(query))
+        # FIX: Use run_async instead of asyncio.run()
+        res = run_async(nexus.hybrid_query(query))
         st.write("### Results")
         col1, col2 = st.columns(2)
         with col1: st.info(f"**Semantic:**\n{res['semantic']}")

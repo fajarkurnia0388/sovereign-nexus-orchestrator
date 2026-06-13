@@ -9,3 +9,5 @@ neo4j
 redis
 psycopg2-binary
 httpx
+networkx
+python-dotenv
