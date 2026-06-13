@@ -8,5 +8,4 @@ qdrant-client
 neo4j
 redis
 psycopg2-binary
-asyncio
 httpx
