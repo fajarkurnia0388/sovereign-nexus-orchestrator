@@ -1,13 +1,57 @@
-mcp
-langgraph
-pyyaml
-pydantic
-pydantic-settings
-llama-index
-qdrant-client
-neo4j
-redis
-psycopg2-binary
-httpx
-networkx
-python-dotenv
+# ============================================================
+# Sovereign Nexus Orchestrator (SNO) — requirements.txt
+# Target: Python 3.11+
+# ============================================================
+
+# ── Core MCP Framework ──────────────────────────────────────
+mcp>=1.0.0,<2.0.0
+
+# ── LangGraph Orchestration ─────────────────────────────────
+# NOTE: In LangGraph 1.x, the SQLite checkpointer is a separate package.
+# The old langgraph.checkpoint.sqlite is now langgraph-checkpoint-sqlite.
+langgraph>=1.2.0,<2.0.0
+langgraph-checkpoint>=4.0.0
+langgraph-checkpoint-sqlite>=3.0.0   # Provides langgraph.checkpoint.sqlite.SqliteSaver
+
+# ── Async SQLite (required by AsyncSqliteSaver) ─────────────
+aiosqlite>=0.19.0
+
+# ── Data Validation ─────────────────────────────────────────
+pydantic>=2.0.0,<3.0.0
+pydantic-settings>=2.0.0,<3.0.0
+
+# ── YAML Parsing ────────────────────────────────────────────
+pyyaml>=6.0
+
+# ── AI / LLM ────────────────────────────────────────────────
+# llama-index was split into llama-index-core + separate provider packages
+llama-index-core>=0.10.0,<1.0.0
+
+# ── Vector Store ────────────────────────────────────────────
+qdrant-client>=1.7.0
+
+# ── Graph Database ──────────────────────────────────────────
+neo4j>=5.0.0
+networkx>=3.0
+
+# ── Caching / Task Queue ────────────────────────────────────
+redis>=5.0.0
+# celery>=5.3.0   # Uncomment when upgrading from asyncio.create_task to Celery workers
+
+# ── Database Driver ─────────────────────────────────────────
+psycopg2-binary>=2.9.0
+
+# ── HTTP Client ─────────────────────────────────────────────
+httpx>=0.25.0
+
+# ── Streamlit Dashboard ─────────────────────────────────────
+streamlit>=1.35.0
+pandas>=2.0.0
+
+# ── Async in Streamlit ──────────────────────────────────────
+# Required: Streamlit's internal event loop conflicts with asyncio.run().
+# nest-asyncio patches the loop to allow nested calls.
+nest-asyncio>=1.6.0
+
+# ── Utilities ───────────────────────────────────────────────
+python-dotenv>=1.0.0
