@@ -1,41 +1,34 @@
 """
-SNO MCP Server — v2.0
+SNO MCP Server — v2.0  (REVISED)
 
-Exposes the Sovereign Nexus Orchestrator as a Model Context Protocol (MCP) server.
-The Hermes Agent (or any MCP-compatible LLM) connects to this server to
-orchestrate complex, multi-step workflows through a clean tool interface.
+Fixes applied:
+  BUG-F (CRITICAL) : `json` module was not imported at module level.
+                     `sno_call_external_agent` called json.dumps() without
+                     any local import, causing NameError at runtime. Fixed:
+                     `import json` added at the top.
 
-Tool Registry (v2.0) — 9 tools:
-  ┌─────────────────────────────┬────────────────────────────────────────────────┐
-  │ Tool Name                   │ Description                                    │
-  ├─────────────────────────────┼────────────────────────────────────────────────┤
-  │ sno_run_playbook            │ Execute a YAML playbook asynchronously          │
-  │ sno_poll_status             │ Check job status and get result when complete   │
-  │ sno_cancel_job              │ Cancel a running job                            │
-  │ sno_list_playbooks          │ List all available playbooks                    │
-  │ sno_create_playbook         │ AI-generate a new playbook from a goal (NEW)    │
-  │ sno_hybrid_query            │ Query the Hybrid Knowledge Nexus                │
-  │ sno_memory_store            │ Store knowledge in the Nexus                    │
-  │ sno_health_check            │ System health and metrics snapshot (NEW)        │
-  │ sno_get_metrics             │ Detailed Prometheus-compatible metrics (NEW)    │
-  └─────────────────────────────┴────────────────────────────────────────────────┘
+  BUG-G            : `sno_run_playbook` called `_executor.submit_job(...)` as a
+                     synchronous call. submit_job is now async (BUG-D fix in
+                     engine.py). Fixed: `await _executor.submit_job(...)`.
 
-Changes from v1.x:
-  - FIX BUG-2: sno_run_playbook now loads from dynamic file, not hardcoded default.
-  - FIX ISU-11: All tools follow sno_{action} naming convention.
-  - FIX ISU-12: All tools have Pydantic input models + annotations + docstrings.
-  - ADD: sno_cancel_job, sno_list_playbooks, sno_create_playbook, sno_health_check,
-          sno_get_metrics, sno_memory_store.
-  - ADD: Authentication via X-SNO-API-Key header (when ENABLE_AUTH=true).
-  - ADD: Per-tool Prometheus counter recording.
+  BUG-H            : `sno_health_check` referenced `_executor._jobs` which does
+                     not exist on SNOExecutor. The job store is in SQLite, not
+                     an in-memory dict. Fixed: use `_executor.count_jobs()`.
+
+  BUG-I            : Auth middleware was applied by setting `mcp.asgi_app = ...`
+                     which is not an attribute recognised by FastMCP's run()
+                     method. FastMCP creates a fresh Starlette app internally
+                     when run() is called, ignoring the attribute. The middleware
+                     setup has been moved to main.py where uvicorn is started
+                     with the wrapped app directly (using mcp.streamable_http_app()).
 """
 from __future__ import annotations
 
-from pathlib import Path
+import json  # BUG-F FIX: was not imported at module level
 
+from mcp.server.fastmcp import FastMCP, Context
+from pydantic import BaseModel, Field, ConfigDict
 import mcp.types as types
-from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, Field
 
 from src.config import settings
 from src.core.engine import SNOExecutor
@@ -47,7 +40,8 @@ from src.utils.logger import get_logger
 
 logger = get_logger("mcp.server")
 
-# ── Initialise singletons ─────────────────────────────────────────────────────
+
+# ── Singletons ────────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
     name="Sovereign Nexus Orchestrator",
@@ -68,162 +62,117 @@ _auth = SNOAuthenticator(
     api_key=settings.sno_api_key,
     enabled=settings.enable_auth,
 )
-if settings.enable_auth:
-    from src.security.auth import MCPAuthMiddleware
-    mcp.asgi_app = MCPAuthMiddleware(mcp.asgi_app, _auth)
+
+# BUG-I FIX: Auth middleware is NOT applied here.
+# FastMCP ignores `mcp.asgi_app = ...` — it creates a new Starlette app
+# internally when `run()` is called.  The correct approach is to:
+#   1. Call `mcp.streamable_http_app()` to get the Starlette app.
+#   2. Wrap it with MCPAuthMiddleware.
+#   3. Pass the wrapped app directly to uvicorn.
+# This is implemented in src/main.py. No middleware setup needed here.
 
 
-# ── Pydantic Input Models ─────────────────────────────────────────────────────
+# ── Pydantic Input Models ──────────────────────────────────────────────────────
 
 class RunPlaybookInput(BaseModel):
-    pb_id: str = Field(
-        ...,
-        description="Playbook ID (filename without .yaml, e.g. 'web_research')",
-        min_length=1,
-        max_length=64,
-    )
-    query: str = Field(
-        ...,
-        description="The primary query or goal passed to the playbook as initial state",
-        min_length=1,
-        max_length=4096,
-    )
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    pb_id: str = Field(..., description="Playbook ID (filename stem, e.g. 'deep_research')", min_length=1, max_length=64)
+    query: str = Field(..., description="Task/query passed as the playbook's initial state", min_length=1, max_length=4096)
 
 
 class PollStatusInput(BaseModel):
-    job_id: str = Field(
-        ...,
-        description="The job_id returned by sno_run_playbook",
-        min_length=8,
-        max_length=8,
-    )
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    job_id: str = Field(..., description="8-character job ID returned by sno_run_playbook", min_length=8, max_length=8)
 
 
 class CancelJobInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     job_id: str = Field(..., description="ID of the job to cancel", min_length=8, max_length=8)
 
 
 class CreatePlaybookInput(BaseModel):
-    goal: str = Field(
-        ...,
-        description=(
-            "Natural language description of what the playbook should accomplish. "
-            "Be specific: include steps, tools, and desired output format."
-        ),
-        min_length=10,
-        max_length=2000,
-    )
-    context: str = Field(
-        default="",
-        description="Optional additional constraints or context for the AI planner",
-        max_length=1000,
-    )
-    provider: str = Field(
-        default="",
-        description="LLM provider: 'openai' | 'anthropic'. Empty = use default from settings.",
-    )
+    model_config = ConfigDict(str_strip_whitespace=True)
+    goal: str = Field(..., description="Natural language description of the workflow goal", min_length=10, max_length=2000)
+    context: str = Field(default="", description="Optional constraints or additional context", max_length=1000)
+    provider: str = Field(default="", description="LLM provider: 'openai' | 'anthropic'. Empty = use default from settings.")
 
 
 class HybridQueryInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
     query: str = Field(..., description="Semantic search query", min_length=1, max_length=1000)
     top_k: int = Field(default=5, ge=1, le=20, description="Max results to return")
-    use_graph: bool = Field(default=True, description="Include graph traversal results")
 
 
 class MemoryStoreInput(BaseModel):
     content: str = Field(..., description="Knowledge content to store", min_length=1)
     tags: list[str] = Field(default=[], description="Optional metadata tags")
-    entity_name: str = Field(
-        default="",
-        description="If set, also creates a named entity node in the knowledge graph",
-    )
+    entity_name: str = Field(default="", description="Named entity node to create in the knowledge graph")
 
 
-# ── MCP Tools ─────────────────────────────────────────────────────────────────
+# ── MCP Tools ──────────────────────────────────────────────────────────────────
 
 @mcp.tool(
     annotations=types.ToolAnnotations(
         title="Run Playbook",
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=False,
-        openWorldHint=True,
+        readOnlyHint=False, destructiveHint=False,
+        idempotentHint=False, openWorldHint=True,
     )
 )
 async def sno_run_playbook(pb_id: str, query: str) -> str:
     """
-    Execute a SNO Playbook asynchronously.
+    Execute a named SNO Playbook asynchronously.
 
-    Loads the YAML playbook identified by `pb_id` from the playbooks directory,
-    compiles it to a LangGraph StateGraph, and executes it as a background job.
+    Loads the YAML playbook identified by `pb_id`, compiles it to a LangGraph
+    StateGraph, and runs it as a background job.  Returns a job_id immediately.
+    Use sno_poll_status to retrieve the result when complete.
 
-    Returns a `job_id` (8-char string) for polling via `sno_poll_status`.
-
-    ⚠️ This tool is NON-BLOCKING. The job runs in the background.
-       Always follow up with `sno_poll_status` to get the final result.
+    ⚠️  NON-BLOCKING — always follow up with sno_poll_status.
 
     Args:
-        pb_id:  Playbook ID — the filename without .yaml (e.g. 'web_research').
-        query:  The primary goal or query to pass into the playbook as initial state.
-
-    Returns:
-        JSON string with job_id and next instructions.
+        pb_id:  Playbook filename stem (without .yaml), e.g. 'deep_research'.
+        query:  Task or question passed as the playbook's initial state input.
     """
     metrics.record_mcp_request("sno_run_playbook")
     try:
-        input_data = RunPlaybookInput(pb_id=pb_id, query=query)
+        params = RunPlaybookInput(pb_id=pb_id, query=query)
     except Exception as exc:
         return f"❌ Invalid input: {exc}"
 
     try:
-        job_id = _executor.submit_job(input_data.pb_id, input_data.query)
-        metrics.record_job_start(input_data.pb_id)
-        logger.info(
-            f"sno_run_playbook: job {job_id} submitted",
-            extra={"job_id": job_id, "playbook": input_data.pb_id},
-        )
-        return (
-            f'{{"job_id": "{job_id}", "playbook": "{input_data.pb_id}", '
-            f'"status": "running", '
-            f'"next": "Poll via sno_poll_status(job_id=\\"{job_id}\\") to get result."}}'
-        )
+        # BUG-G FIX: submit_job is now async — must be awaited.
+        job_id = await _executor.submit_job(params.pb_id, params.query)
+        metrics.record_job_start(params.pb_id)
+        logger.info("sno_run_playbook: job %s submitted.", job_id, extra={"job_id": job_id})
+        return json.dumps({
+            "job_id": job_id,
+            "playbook": params.pb_id,
+            "status": "running",
+            "next": f"Poll via sno_poll_status(job_id='{job_id}') to get the result.",
+        }, indent=2)
     except FileNotFoundError as exc:
         metrics.record_error("playbook_not_found", "sno_run_playbook")
         return f"❌ {exc}"
     except Exception as exc:
         metrics.record_error("job_submission_error", "sno_run_playbook")
-        logger.error(f"sno_run_playbook error: {exc}", exc_info=True)
+        logger.error("sno_run_playbook error: %s", exc, exc_info=True)
         return f"❌ Failed to submit job: {exc}"
 
 
 @mcp.tool(
     annotations=types.ToolAnnotations(
         title="Poll Job Status",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        readOnlyHint=True, destructiveHint=False,
+        idempotentHint=True, openWorldHint=False,
     )
 )
 async def sno_poll_status(job_id: str) -> str:
     """
-    Check the status of a running SNO job and retrieve its result when complete.
+    Check the status of a running SNO job and retrieve the result when complete.
 
-    Poll this tool after calling `sno_run_playbook`. The recommended polling
-    strategy is exponential backoff starting at 2 seconds.
-
-    Status values:
-      - 'pending'   — job is queued, not yet started.
-      - 'running'   — job is actively executing nodes.
-      - 'success'   — job completed. Result is available.
-      - 'failed'    — job encountered an unrecoverable error.
-      - 'cancelled' — job was cancelled via sno_cancel_job.
+    Status values: 'pending' | 'running' | 'success' | 'failed' | 'cancelled'
 
     Args:
-        job_id: The 8-character job ID returned by sno_run_playbook.
-
-    Returns:
-        JSON string with full job record including status, result, progress, and timing.
+        job_id: 8-character job ID returned by sno_run_playbook.
     """
     metrics.record_mcp_request("sno_poll_status")
     try:
@@ -233,106 +182,85 @@ async def sno_poll_status(job_id: str) -> str:
 
     record = _executor.get_job(job_id)
     if not record:
-        return f'{{"error": "Job \'{job_id}\' not found. Verify the job_id."}}'
+        return json.dumps({"error": f"Job '{job_id}' not found. Verify the job_id."})
 
-    import json
-    result = record.to_dict()
+    data = record.to_dict()
     if record.status.value == "success":
-        result["cognitive_summary"] = record.result
-    return json.dumps(result, indent=2)
+        data["cognitive_summary"] = record.result
+    return json.dumps(data, indent=2)
 
 
 @mcp.tool(
     annotations=types.ToolAnnotations(
         title="Cancel Job",
-        readOnlyHint=False,
-        destructiveHint=True,
-        idempotentHint=False,
-        openWorldHint=False,
+        readOnlyHint=False, destructiveHint=True,
+        idempotentHint=False, openWorldHint=False,
     )
 )
 async def sno_cancel_job(job_id: str) -> str:
     """
-    Cancel a running SNO job.
-
-    Sends a cancellation signal to the asyncio task backing the job.
-    The job may not stop immediately — check sno_poll_status to confirm.
-
-    ⚠️ Cancellation is irreversible. Cancelled jobs cannot be resumed.
+    Cancel a running SNO job. ⚠️ Irreversible.
 
     Args:
-        job_id: The 8-character job ID to cancel.
-
-    Returns:
-        Confirmation string.
+        job_id: 8-character job ID to cancel.
     """
     metrics.record_mcp_request("sno_cancel_job")
-    CancelJobInput(job_id=job_id)
+    try:
+        CancelJobInput(job_id=job_id)
+    except Exception as exc:
+        return f"❌ Invalid input: {exc}"
+
     cancelled = _executor.cancel_job(job_id)
     if cancelled:
         return f'✅ Cancellation requested for job "{job_id}". Poll sno_poll_status to confirm.'
     record = _executor.get_job(job_id)
     if not record:
         return f'❌ Job "{job_id}" not found.'
-    return f'ℹ️ Job "{job_id}" is in state "{record.status.value}" — cannot cancel.'
+    return f'ℹ️  Job "{job_id}" is in state "{record.status.value}" — cannot cancel.'
 
 
 @mcp.tool(
     annotations=types.ToolAnnotations(
         title="List Playbooks",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        readOnlyHint=True, destructiveHint=False,
+        idempotentHint=True, openWorldHint=False,
     )
 )
 async def sno_list_playbooks() -> str:
     """
-    List all available SNO Playbooks in the playbooks directory.
+    List all available SNO Playbooks in the playbooks/ directory.
 
-    Returns metadata for each playbook: id, name, description, version, node_count.
-    Use this before calling sno_run_playbook to discover valid pb_id values.
-
-    Returns:
-        JSON array of playbook metadata objects.
+    Returns metadata for each: id, name, description, version, node_count.
+    Use before sno_run_playbook to discover valid pb_id values.
     """
     metrics.record_mcp_request("sno_list_playbooks")
-    import json
     playbooks = _executor.list_playbooks()
     if not playbooks:
-        return '{"playbooks": [], "hint": "No playbooks found. Use sno_create_playbook to generate one."}'
+        return json.dumps({
+            "playbooks": [],
+            "hint": "No playbooks found. Use sno_create_playbook to generate one.",
+        })
     return json.dumps({"playbooks": playbooks, "count": len(playbooks)}, indent=2)
 
 
 @mcp.tool(
     annotations=types.ToolAnnotations(
         title="Create Playbook (AI Planner)",
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=False,
-        openWorldHint=True,
+        readOnlyHint=False, destructiveHint=False,
+        idempotentHint=False, openWorldHint=True,
     )
 )
 async def sno_create_playbook(goal: str, context: str = "", provider: str = "") -> str:
     """
     Use the SNO AI Planner to generate a new YAML Playbook from a natural language goal.
 
-    The Planner calls an LLM (OpenAI or Anthropic based on configuration), generates
-    a structured YAML playbook, validates it against the SNO schema, and saves it
-    to the playbooks directory — ready for immediate execution via sno_run_playbook.
-
-    ✨ This is the recommended way to create new workflows without writing YAML manually.
+    The Planner calls an LLM (OpenAI or Anthropic), generates a structured YAML
+    playbook, validates it, and saves it to the playbooks/ directory.
 
     Args:
-        goal:     Natural language description of the workflow objective.
-                  Be specific: "Research the top 5 Python web frameworks, compare
-                  their GitHub stars, docs quality, and performance benchmarks,
-                  then write a markdown comparison table."
-        context:  Optional additional constraints or context.
-        provider: LLM provider: 'openai' | 'anthropic'. Empty = use default from .env.
-
-    Returns:
-        JSON with playbook_id, node_count, path (if saved), and validation status.
+        goal:     Natural language objective. Be specific.
+        context:  Optional constraints or context.
+        provider: 'openai' | 'anthropic'. Empty = use settings.default_llm_provider.
     """
     metrics.record_mcp_request("sno_create_playbook")
     try:
@@ -344,10 +272,9 @@ async def sno_create_playbook(goal: str, context: str = "", provider: str = "") 
         result = await _planner.generate(
             goal=params.goal,
             context=params.context,
-            provider=params.provider if params.provider else None,
+            provider=params.provider or None,
             save=True,
         )
-        import json
         if result["validated"]:
             pb_id = result["playbook_id"]
             return json.dumps({
@@ -360,81 +287,60 @@ async def sno_create_playbook(goal: str, context: str = "", provider: str = "") 
         else:
             return json.dumps({
                 "status": "validation_failed",
-                "warning": "Playbook generated but failed schema validation. Review yaml_content before use.",
+                "warning": "Generated but failed schema validation. Review yaml_content before use.",
                 "yaml_content": result["yaml_content"],
             }, indent=2)
     except Exception as exc:
         metrics.record_error("planner_error", "sno_create_playbook")
-        logger.error(f"sno_create_playbook error: {exc}", exc_info=True)
+        logger.error("sno_create_playbook error: %s", exc, exc_info=True)
         return f"❌ Playbook generation failed: {exc}"
 
 
 @mcp.tool(
     annotations=types.ToolAnnotations(
         title="Hybrid Knowledge Query",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        readOnlyHint=True, destructiveHint=False,
+        idempotentHint=True, openWorldHint=False,
     )
 )
-async def sno_hybrid_query(query: str, top_k: int = 5, use_graph: bool = True) -> str:
+async def sno_hybrid_query(query: str, top_k: int = 5) -> str:
     """
-    Query the SNO Hybrid Knowledge Nexus — combining vector semantic search
-    with graph-based relational traversal.
-
-    Use this to retrieve relevant knowledge stored in the Nexus before planning
-    a complex task. This prevents redundant work and grounds reasoning in
-    previously validated information.
+    Query the SNO Hybrid Knowledge Nexus (vector semantic + graph traversal).
 
     Args:
-        query:     Natural language search query.
-        top_k:     Maximum number of semantic results to return (default: 5, max: 20).
-        use_graph: If True, augments results with related entities from the graph store.
-
-    Returns:
-        JSON with semantic_results (list) and graph_context (dict).
+        query:  Natural language search query.
+        top_k:  Max semantic results (default: 5, max: 20).
     """
     metrics.record_mcp_request("sno_hybrid_query")
     try:
-        params = HybridQueryInput(query=query, top_k=top_k, use_graph=use_graph)
+        params = HybridQueryInput(query=query, top_k=top_k)
     except Exception as exc:
         return f"❌ Invalid input: {exc}"
 
     try:
         result = await _nexus.query(params.query, top_k=params.top_k)
-        import json
         return json.dumps(result, indent=2)
     except Exception as exc:
         metrics.record_error("nexus_query_error", "sno_hybrid_query")
-        logger.error(f"sno_hybrid_query error: {exc}")
+        logger.error("sno_hybrid_query error: %s", exc)
         return f"❌ Nexus query failed: {exc}"
 
 
 @mcp.tool(
     annotations=types.ToolAnnotations(
         title="Store Knowledge in Nexus",
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=False,
-        openWorldHint=False,
+        readOnlyHint=False, destructiveHint=False,
+        idempotentHint=False, openWorldHint=False,
     )
 )
 async def sno_memory_store(content: str, tags: list[str] | None = None, entity_name: str = "") -> str:
     """
     Store a piece of knowledge in the SNO Hybrid Nexus for future retrieval.
 
-    Automatically adds the content to both the vector store (for semantic search)
-    and optionally creates a named entity node in the knowledge graph.
-
     Args:
-        content:      The knowledge text to store.
-        tags:         Optional list of metadata tags for filtering.
-        entity_name:  Optional. If set, creates a named entity in the graph.
-                      Use for people, companies, concepts, tools, etc.
-
-    Returns:
-        Confirmation with the assigned document ID.
+        content:      Text knowledge to store.
+        tags:         Optional metadata tags.
+        entity_name:  If set, creates a named entity node in the graph.
     """
     metrics.record_mcp_request("sno_memory_store")
     try:
@@ -456,28 +362,19 @@ async def sno_memory_store(content: str, tags: list[str] | None = None, entity_n
 
 @mcp.tool(
     annotations=types.ToolAnnotations(
-        title="Health Check",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        title="System Health Check",
+        readOnlyHint=True, destructiveHint=False,
+        idempotentHint=True, openWorldHint=False,
     )
 )
 async def sno_health_check() -> str:
     """
-    Return a comprehensive health status of the SNO system.
+    Return comprehensive health status of all SNO subsystems.
 
-    Checks connectivity to all sub-systems (database, Redis, Nexus stores)
-    and returns current operational metrics. Use this to verify SNO is
-    functioning correctly before submitting critical jobs.
-
-    Returns:
-        JSON with overall status, sub-system health, and active job count.
+    Checks database, Redis, Nexus, and active job counts.
     """
     metrics.record_mcp_request("sno_health_check")
-    import json
-
-    checks = {
+    checks: dict = {
         "sno_version": settings.sno_version,
         "environment": settings.sno_env,
         "auth_enabled": settings.enable_auth,
@@ -486,26 +383,21 @@ async def sno_health_check() -> str:
 
     # Database check
     try:
-        import sqlite3
-        conn = sqlite3.connect(settings.db_path)
-        conn.execute("SELECT 1")
-        conn.close()
+        _executor._conn.execute("SELECT 1")
         checks["subsystems"]["database"] = "healthy"
     except Exception as exc:
         checks["subsystems"]["database"] = f"unhealthy: {exc}"
 
     # Nexus check
-    nexus_health = await _nexus.health_check()
-    checks["subsystems"]["nexus"] = nexus_health
+    checks["subsystems"]["nexus"] = await _nexus.health_check()
 
-    # Job store
-    all_jobs = _executor.get_all_jobs(limit=10)
-    running = sum(1 for j in all_jobs if j["status"] == "running")
-    checks["active_jobs"] = running
-    checks["total_jobs_tracked"] = len(_executor._jobs)
+    # BUG-H FIX: _executor._jobs does not exist.
+    # Job data is in SQLite, not an in-memory dict.
+    # Use count_jobs() (DB query) and _active_tasks for running count.
+    checks["total_jobs_in_db"] = _executor.count_jobs()   # BUG-H FIX
+    checks["active_jobs_in_process"] = len(_executor._active_tasks)
 
-    # Overall status
-    unhealthy = [k for k, v in checks["subsystems"].items() if str(v) != "healthy"]
+    unhealthy = [k for k, v in checks["subsystems"].items() if "unhealthy" in str(v)]
     checks["overall_status"] = "degraded" if unhealthy else "healthy"
     checks["degraded_subsystems"] = unhealthy
 
@@ -514,59 +406,42 @@ async def sno_health_check() -> str:
 
 @mcp.tool(
     annotations=types.ToolAnnotations(
-        title="Get Metrics",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        title="Get Metrics Snapshot",
+        readOnlyHint=True, destructiveHint=False,
+        idempotentHint=True, openWorldHint=False,
     )
 )
 async def sno_get_metrics() -> str:
     """
-    Return a detailed metrics snapshot of the SNO system.
-
-    Includes job counters, duration percentiles (p50/p95/p99), node execution
-    counts, MCP request totals, and error breakdowns.
-
-    Returns:
-        JSON metrics snapshot compatible with Prometheus label conventions.
+    Return a detailed metrics snapshot: job counters, duration percentiles,
+    MCP request totals, and error breakdowns.
     """
     metrics.record_mcp_request("sno_get_metrics")
-    import json
     return json.dumps(metrics.snapshot(), indent=2)
 
 
 @mcp.tool(
     annotations=types.ToolAnnotations(
         title="Call External MCP Agent",
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=False,
-        openWorldHint=True,
+        readOnlyHint=False, destructiveHint=False,
+        idempotentHint=False, openWorldHint=True,
     )
 )
 async def sno_call_external_agent(server_url: str, tool_name: str, args: dict | None = None) -> str:
     """
     Proxy a tool call to an external MCP server via the SNO MCP Bridge.
 
-    Enables SNO to orchestrate other MCP-compatible agents, making it possible
-    to chain multiple specialised agents into a single workflow.
-
     Args:
-        server_url: Base URL of the target server (e.g. 'http://localhost:8001').
-        tool_name:  Name of the tool to invoke on the remote server.
-        args:       Optional dictionary of arguments to forward to the tool.
-
-    Returns:
-        JSON response from the external server or an error message.
+        server_url: Base URL of the target MCP server (e.g. 'http://localhost:8001').
+        tool_name:  Tool name to invoke on the remote server.
+        args:       Optional arguments to forward.
     """
     metrics.record_mcp_request("sno_call_external_agent")
     try:
         from src.mcp.bridge import bridge
         res = await bridge.call_external_tool(server_url, tool_name, args or {})
-        return json.dumps(res, indent=2)
+        return json.dumps(res, indent=2)  # BUG-F FIX: json was never imported before
     except Exception as exc:
         metrics.record_error("bridge_error", "sno_call_external_agent")
-        logger.error(f"sno_call_external_agent failed: {exc}", exc_info=True)
+        logger.error("sno_call_external_agent failed: %s", exc, exc_info=True)
         return f"❌ MCP Bridge failed: {exc}"
-

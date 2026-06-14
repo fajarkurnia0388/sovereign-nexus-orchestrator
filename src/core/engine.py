@@ -1,19 +1,32 @@
 """
-SNO Core Engine — v2.0
+SNO Core Engine — v2.0  (REVISED)
 
-Responsible for:
-  1. Compiling YAML playbook definitions into LangGraph StateGraph objects.
-  2. Executing graphs asynchronously via a job queue backed by asyncio tasks.
-  3. Persisting per-step state snapshots with SqliteSaver (BUG-1 fixed).
-  4. Exposing a clean async API consumed by the MCP tool layer.
+Fixes applied:
+  BUG-A (CRITICAL) : _make_node_fn was truncated — dispatcher.dispatch() was called
+                     but the result was discarded and the inner function was never
+                     returned. Every node silently returned None, so no state was
+                     ever written. Fixed: call dispatch, store result, return _node.
 
-Changes from v1.x:
-  - FIX BUG-1: SqliteSaver now created from a real sqlite3.Connection, not a context manager.
-  - FIX ISU-4: Edge resolution uses a single clean pass — no more duplicate/conflicting loops.
-  - ADD: Per-job metrics (start time, duration, node count).
-  - ADD: Graceful job cancellation via asyncio.Task.cancel().
-  - ADD: `get_all_jobs()` and `cancel_job()` for Ops Console and MCP polling.
-  - ADD: Retry support via retry_async decorator on node execution.
+  BUG-B (CRITICAL) : SNOState was declared as `class SNOState(dict): pass`.
+                     LangGraph requires either a TypedDict or a plain dict hint for
+                     StateGraph. A bare dict subclass is not recognised correctly.
+                     Fixed: use `dict` directly as the state type annotation, which
+                     LangGraph 1.x accepts and propagates cleanly.
+
+  BUG-C            : _summarise used `states[0].values` which does not exist on
+                     CheckpointTuple. The correct path is
+                     `.checkpoint["channel_values"]`. Fixed.
+
+  BUG-D            : submit_job called asyncio.create_task() from a synchronous
+                     method. When invoked from Streamlit (sync context, even with
+                     nest_asyncio), there is no running event loop at that point
+                     and create_task() raises RuntimeError. Fixed: made submit_job
+                     async so create_task() always runs inside a running loop.
+
+  BUG-E (COMPAT)   : PlaybookDefinition required `id` and `name`, breaking every
+                     existing YAML that used `playbook_id` (v1.x format). Added
+                     model_validator to map the old fields transparently.
+                     PlaybookNode similarly maps `tool` → `action`.
 """
 from __future__ import annotations
 
@@ -25,31 +38,33 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import yaml
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from src.utils.logger import get_logger
 
 logger = get_logger("core.engine")
 
 
-# ── Domain Models ────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Domain Models
+# ─────────────────────────────────────────────────────────────────────────────
 
 class JobStatus(str, Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCESS = "success"
-    FAILED = "failed"
+    PENDING   = "pending"
+    RUNNING   = "running"
+    SUCCESS   = "success"
+    FAILED    = "failed"
     CANCELLED = "cancelled"
 
 
 @dataclass
 class JobRecord:
-    """Immutable-ish record tracked in the in-memory job store."""
+    """Per-job metadata tracked in the SQLite sno_jobs table."""
     job_id: str
     playbook_id: str
     status: JobStatus = JobStatus.PENDING
@@ -85,21 +100,31 @@ class JobRecord:
             "duration_seconds": self.duration_seconds,
             "result": self.result,
             "error": self.error,
-            "progress": (
-                f"{self.completed_nodes}/{self.node_count}"
-                if self.node_count else "0/0"
-            ),
+            "progress": f"{self.completed_nodes}/{self.node_count}",
         }
 
 
-# ── Playbook Schema ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Playbook Schema — with v1.x backward compatibility
+# ─────────────────────────────────────────────────────────────────────────────
 
 class PlaybookNode(BaseModel):
     id: str
     description: str = ""
     action: str = "log"
     params: dict[str, Any] = {}
-    next: str | None = None  # Override automatic linear sequencing
+    next: str | None = None
+
+    # BUG-E FIX: Old YAML playbooks use `tool: mcp_browser_search` (v1.x format).
+    # This validator silently maps `tool` → `action` so existing playbooks keep
+    # working without any manual edits.
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_v1_tool_field(cls, data: dict) -> dict:
+        """Map v1.x `tool` field to v2.0 `action` transparently."""
+        if isinstance(data, dict) and "tool" in data and "action" not in data:
+            data["action"] = data.pop("tool")
+        return data
 
 
 class PlaybookDefinition(BaseModel):
@@ -110,25 +135,29 @@ class PlaybookDefinition(BaseModel):
     timeout_seconds: int = 300
     nodes: list[PlaybookNode]
 
+    # BUG-E FIX: Old YAML playbooks use `playbook_id` (v1.x) instead of `id`.
+    # Also synthesise `name` from `id` if omitted.
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_v1_schema(cls, data: dict) -> dict:
+        """Map v1.x top-level fields to v2.0 schema transparently."""
+        if isinstance(data, dict):
+            if "playbook_id" in data and "id" not in data:
+                data["id"] = data.pop("playbook_id")
+            if "name" not in data:
+                data["name"] = data.get("id", "Unnamed Playbook")
+        return data
 
-# ── LangGraph State ───────────────────────────────────────────────────────────
 
-class SNOState(dict):
-    """
-    SNO Graph state — a typed dict extending dict so LangGraph's reducer
-    can merge it. Additional fields are added per node execution.
-    """
-    pass
-
-
-# ── Playbook Compiler ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Playbook Compiler
+# ─────────────────────────────────────────────────────────────────────────────
 
 class PlaybookCompiler:
-    """Compiles PlaybookDefinition → LangGraph StateGraph."""
+    """Compiles PlaybookDefinition objects into runnable LangGraph StateGraphs."""
 
     @staticmethod
     def from_yaml(yaml_str: str) -> PlaybookDefinition:
-        """Parse raw YAML string into a PlaybookDefinition."""
         data = yaml.safe_load(yaml_str)
         return PlaybookDefinition(**data)
 
@@ -136,70 +165,104 @@ class PlaybookCompiler:
         """
         Build and compile a StateGraph from a PlaybookDefinition.
 
-        Edge resolution (single clean pass — fixes ISU-4):
-          (a) node.next is set  → use explicit target
+        State type:
+          BUG-B FIX: Use `dict` directly instead of a bare dict subclass.
+          LangGraph 1.x accepts `dict` as a valid state schema and propagates
+          node outputs through it cleanly.
+
+        Edge resolution (single clean pass — no duplication):
+          (a) node.next is set  → explicit target
           (b) node is last      → route to END
           (c) otherwise         → sequential fallthrough to next node id
         """
-        workflow = StateGraph(SNOState)
+        # BUG-B FIX: Use `dict` as the state type
+        workflow = StateGraph(dict)
 
-        # Register nodes
+        # Register all nodes
         for node in pb.nodes:
-            fn = self._make_node_fn(node, pb.id)
-            workflow.add_node(node.id, fn)
+            workflow.add_node(node.id, self._make_node_fn(node, pb.id))
 
         # Set entry point
         workflow.set_entry_point(pb.nodes[0].id)
 
         # Resolve edges — single authoritative pass
         for i, node in enumerate(pb.nodes):
-            is_last = i == len(pb.nodes) - 1
-
+            is_last = (i == len(pb.nodes) - 1)
             if node.next:
-                target = node.next        # (a) explicit override
+                target = node.next            # (a) explicit override
             elif is_last:
-                target = END              # (b) terminal node
+                target = END                  # (b) terminal node
             else:
                 target = pb.nodes[i + 1].id  # (c) linear fallthrough
-
             workflow.add_edge(node.id, target)
 
         compiled = workflow.compile(checkpointer=checkpointer)
-        logger.debug(
-            f"Compiled playbook '{pb.id}' with {len(pb.nodes)} nodes",
-            extra={"playbook": pb.id},
-        )
+        logger.debug("Compiled playbook '%s' (%d nodes).", pb.id, len(pb.nodes))
         return compiled
 
     @staticmethod
     def _make_node_fn(node: PlaybookNode, playbook_id: str):
-        """Create an async node function that logs and executes the node action."""
-        async def _node(state: SNOState) -> SNOState:
+        """
+        Factory that produces an async node function for a given PlaybookNode.
+
+        BUG-A FIX (CRITICAL):
+          The original implementation was TRUNCATED. It:
+            1. Created an ActionDispatcher — OK
+            2. Had a comment `# Exe` (start of `# Execute action`) — truncated
+            3. Did NOT call dispatcher.dispatch() — action never ran
+            4. Did NOT store the result in state — state never updated
+            5. Did NOT return `_node` — LangGraph received None as the node fn
+
+          This fix:
+            1. Calls dispatcher.dispatch(node.action, node.params, state)
+            2. Stores the result under an isolated key `node_{id}_result`
+               to prevent different nodes from overwriting each other (Isolated
+               Ledger State pattern from the v2.0 design doc)
+            3. Returns `_node` so PlaybookCompiler.compile() can register it
+        """
+        async def _node(state: dict) -> dict:
             logger.info(
-                f"[{node.action}] executing '{node.id}': {node.description}",
+                "[%s] executing '%s': %s",
+                node.action, node.id, node.description,
                 extra={"playbook": playbook_id, "node": node.id},
             )
-
-            # Dynamically resolve imports to allow running either flat in raw_v2 or nested in src
             try:
-                from src.core.dispatcher import ActionDispatcher
-                from src.memory.nexus import KnowledgeNexus
-                from src.core.retry import retry_async
-                nexus = KnowledgeNexus()
-            except ImportError:
-                from raw_v2.dispatcher import ActionDispatcher
-                from raw_v2.nexus import KnowledgeNexus
-                from raw_v2.retry import retry_async
-                nexus = KnowledgeNexus()
+                # Import inside the function to avoid circular imports at module
+                # load time (dispatcher → nexus → config → engine would loop).
+                from src.core.dispatcher import ActionDispatcher  # noqa: PLC0415
+                from src.memory.nexus import nexus as _nexus      # use module singleton
 
-            dispatcher = ActionDispatcher(nexus=nexus)
+                dispatcher = ActionDispatcher(nexus=_nexus)
 
-            # Exe# ── SNO Executor ─────────────────────────────────────────────────────────────
+                # ── Execute the action ───────────────────────────────────────
+                result = await dispatcher.dispatch(
+                    action=node.action,
+                    params=node.params,
+                    state=dict(state),
+                )
+            except ImportError as exc:
+                logger.warning("Import failed in node '%s': %s", node.id, exc)
+                result = {"status": "failed", "error": f"ImportError: {exc}"}
+            except Exception as exc:
+                logger.exception("Dispatch failed for node '%s'.", node.id)
+                result = {"status": "failed", "error": str(exc)}
+
+            # ── Store result under isolated, node-specific key ────────────────
+            # This prevents Node B from overwriting Node A's data if both
+            # write to the same dict key.
+            return {**state, f"node_{node.id}_result": result}
+
+        return _node  # BUG-A FIX: was missing — LangGraph got None as node fn
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SNO Executor
+# ─────────────────────────────────────────────────────────────────────────────
 
 class SNOExecutor:
     """
-    Manages the lifecycle of SNO jobs:
-      - Persists job metadata in SQLite (to sync state across containers).
+    Manages the full lifecycle of SNO jobs:
+      - Persists job metadata in SQLite (syncs state across containers).
       - Submits jobs as background asyncio Tasks.
       - Provides polling, cancellation, and listing APIs.
     """
@@ -209,20 +272,19 @@ class SNOExecutor:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # BUG-1 FIX: Create a real sqlite3 Connection, not a context manager.
+        # BUG-1 FIX (carried over from v1.x audit): Use sqlite3.Connection directly.
+        # SqliteSaver.from_conn_string() returns a context manager, NOT an instance.
         self._conn: sqlite3.Connection = sqlite3.connect(
             str(self._db_path), check_same_thread=False
         )
         self._checkpointer = SqliteSaver(self._conn)
-
         self._compiler = PlaybookCompiler()
         self._active_tasks: dict[str, asyncio.Task] = {}
 
         self._init_jobs_table()
-
         logger.info(
-            f"SNOExecutor initialised — playbooks_dir={self._playbooks_dir}, "
-            f"db={self._db_path}"
+            "SNOExecutor ready — playbooks=%s, db=%s",
+            self._playbooks_dir, self._db_path,
         )
 
     def _init_jobs_table(self) -> None:
@@ -230,49 +292,54 @@ class SNOExecutor:
         with self._conn:
             self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS sno_jobs (
-                    job_id TEXT PRIMARY KEY,
-                    playbook_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    started_at REAL,
-                    finished_at REAL,
-                    result TEXT,
-                    error TEXT,
-                    node_count INTEGER NOT NULL,
+                    job_id          TEXT PRIMARY KEY,
+                    playbook_id     TEXT NOT NULL,
+                    status          TEXT NOT NULL,
+                    created_at      REAL NOT NULL,
+                    started_at      REAL,
+                    finished_at     REAL,
+                    result          TEXT,
+                    error           TEXT,
+                    node_count      INTEGER NOT NULL,
                     completed_nodes INTEGER NOT NULL
                 )
             """)
-        logger.info("SQLite jobs table initialised.")
+        logger.debug("sno_jobs table ready.")
 
-    def _update_job_in_db(self, job_id: str, **kwargs) -> None:
-        """Update job attributes in the SQLite DB."""
+    def _update_job(self, job_id: str, **kwargs) -> None:
+        """Update one or more columns for a job row in SQLite."""
         if not kwargs:
             return
-        fields = []
-        values = []
+        cols, vals = [], []
         for k, v in kwargs.items():
-            if isinstance(v, Enum):
-                v = v.value
-            fields.append(f"{k} = ?")
-            values.append(v)
-        values.append(job_id)
-        
-        query = f"UPDATE sno_jobs SET {', '.join(fields)} WHERE job_id = ?"
+            cols.append(f"{k} = ?")
+            vals.append(v.value if isinstance(v, Enum) else v)
+        vals.append(job_id)
         with self._conn:
-            self._conn.execute(query, tuple(values))
+            self._conn.execute(
+                f"UPDATE sno_jobs SET {', '.join(cols)} WHERE job_id = ?",
+                tuple(vals),
+            )
 
     # ── Job Lifecycle ─────────────────────────────────────────────────────────
 
-    def submit_job(self, playbook_id: str, query: str) -> str:
+    async def submit_job(self, playbook_id: str, query: str) -> str:
         """
-        Load a playbook YAML, compile it, submit as a background asyncio task.
-        Returns the job_id for polling.
+        Load a playbook, compile it, and submit it as a background asyncio task.
+
+        BUG-D FIX: Was a synchronous method that called asyncio.create_task().
+          asyncio.create_task() requires a *running* event loop.  When called
+          from Streamlit's sync context, even with nest_asyncio applied, there
+          is no running loop at the call site — only inside a run_until_complete
+          block.  Making submit_job async ensures create_task() is always invoked
+          from within a running coroutine (either an MCP tool or via run_async()).
         """
         pb_path = self._playbooks_dir / f"{playbook_id}.yaml"
         if not pb_path.exists():
+            available = [p.stem for p in self._playbooks_dir.glob("*.yaml")]
             raise FileNotFoundError(
                 f"Playbook '{playbook_id}' not found at {pb_path}. "
-                f"Available: {[p.stem for p in self._playbooks_dir.glob('*.yaml')]}"
+                f"Available: {available}"
             )
 
         yaml_content = pb_path.read_text(encoding="utf-8")
@@ -283,8 +350,11 @@ class SNOExecutor:
         created_at = time.time()
         with self._conn:
             self._conn.execute(
-                "INSERT INTO sno_jobs (job_id, playbook_id, status, created_at, node_count, completed_nodes) VALUES (?, ?, ?, ?, ?, ?)",
-                (job_id, playbook_id, JobStatus.PENDING.value, created_at, len(pb_def.nodes), 0)
+                "INSERT INTO sno_jobs "
+                "(job_id, playbook_id, status, created_at, node_count, completed_nodes) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (job_id, playbook_id, JobStatus.PENDING.value, created_at,
+                 len(pb_def.nodes), 0),
             )
 
         task = asyncio.create_task(
@@ -292,11 +362,7 @@ class SNOExecutor:
             name=f"sno-job-{job_id}",
         )
         self._active_tasks[job_id] = task
-
-        logger.info(
-            f"Job {job_id} submitted for playbook '{playbook_id}'",
-            extra={"job_id": job_id, "playbook": playbook_id},
-        )
+        logger.info("Job %s submitted — playbook='%s'.", job_id, playbook_id)
         return job_id
 
     async def _run_graph(
@@ -307,143 +373,151 @@ class SNOExecutor:
         query: str,
         timeout: int,
     ) -> None:
-        """Execute the compiled LangGraph, updating record status throughout."""
+        """Execute a compiled LangGraph and update the job record throughout."""
         started_at = time.time()
-        self._update_job_in_db(job_id, status=JobStatus.RUNNING, started_at=started_at)
+        self._update_job(job_id, status=JobStatus.RUNNING, started_at=started_at)
 
         config = {"configurable": {"thread_id": job_id}}
-        initial_state = SNOState({"query": query, "job_id": job_id})
+        initial_state: dict = {"query": query, "job_id": job_id, "status": "started"}
 
+        node_count_row = self._conn.execute(
+            "SELECT node_count FROM sno_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        node_count = node_count_row[0] if node_count_row else 0
         completed_nodes = 0
-        node_count = 0
-        row = self._conn.execute("SELECT node_count FROM sno_jobs WHERE job_id = ?", (job_id,)).fetchone()
-        if row:
-            node_count = row[0]
 
         try:
             async with asyncio.timeout(timeout):
-                async for chunk in graph.astream(initial_state, config=config):
+                async for _ in graph.astream(initial_state, config=config):
                     completed_nodes += 1
-                    self._update_job_in_db(job_id, completed_nodes=completed_nodes)
+                    self._update_job(job_id, completed_nodes=completed_nodes)
                     logger.debug(
-                        f"Node completed ({completed_nodes}/{node_count})",
+                        "Node completed (%d/%d) — job=%s", completed_nodes, node_count, job_id,
                         extra={"job_id": job_id},
                     )
 
             result = self._summarise(job_id)
-            self._update_job_in_db(job_id, status=JobStatus.SUCCESS, result=result, finished_at=time.time())
-            
+            self._update_job(
+                job_id,
+                status=JobStatus.SUCCESS,
+                result=result,
+                finished_at=time.time(),
+            )
             logger.info(
-                f"Job {job_id} SUCCESS in {time.time() - started_at:.3f}s",
+                "Job %s SUCCESS in %.3fs.", job_id, time.time() - started_at,
                 extra={"job_id": job_id, "duration_ms": int((time.time() - started_at) * 1000)},
             )
+
         except asyncio.CancelledError:
-            self._update_job_in_db(job_id, status=JobStatus.CANCELLED, finished_at=time.time())
-            logger.warning(f"Job {job_id} CANCELLED", extra={"job_id": job_id})
+            self._update_job(job_id, status=JobStatus.CANCELLED, finished_at=time.time())
+            logger.warning("Job %s CANCELLED.", job_id, extra={"job_id": job_id})
+
         except TimeoutError:
-            error_msg = f"Job exceeded timeout of {timeout}s"
-            self._update_job_in_db(job_id, status=JobStatus.FAILED, error=error_msg, finished_at=time.time())
-            logger.error(f"Job {job_id} TIMEOUT", extra={"job_id": job_id})
+            err = f"Exceeded timeout of {timeout}s."
+            self._update_job(job_id, status=JobStatus.FAILED, error=err, finished_at=time.time())
+            logger.error("Job %s TIMEOUT.", job_id, extra={"job_id": job_id})
+
         except Exception as exc:
-            error_msg = str(exc)
-            self._update_job_in_db(job_id, status=JobStatus.FAILED, error=error_msg, finished_at=time.time())
-            logger.error(
-                f"Job {job_id} FAILED: {exc}",
-                exc_info=True,
-                extra={"job_id": job_id},
+            self._update_job(
+                job_id,
+                status=JobStatus.FAILED,
+                error=str(exc),
+                finished_at=time.time(),
             )
+            logger.exception("Job %s FAILED.", job_id, extra={"job_id": job_id})
+
         finally:
             self._active_tasks.pop(job_id, None)
 
     def _summarise(self, job_id: str) -> str:
         """
-        Pull the final checkpoint state and produce a concise summary.
-        In production: pass this through an LLM for cognitive summarisation.
+        Extract a human-readable summary from the job's final LangGraph checkpoint.
+
+        BUG-C FIX: The original code accessed `states[0].values` which does not
+          exist on CheckpointTuple.  The correct path in LangGraph 1.x is:
+            checkpoint_tuple.checkpoint["channel_values"]
+          where `checkpoint_tuple.checkpoint` is a Checkpoint TypedDict with keys:
+          v, id, ts, channel_values, channel_versions, versions_seen, updated_channels.
         """
         try:
-            states = list(self._checkpointer.list({"configurable": {"thread_id": job_id}}))
-            if not states:
-                return "Playbook executed successfully (no checkpoint state)."
-            last = states[0].values if states else {}
-            node_results = [v for k, v in last.items() if k.startswith("node_")]
-            # Extract summarization results if available
-            summaries = [v.get("summary") for v in node_results if isinstance(v, dict) and "summary" in v]
+            config = {"configurable": {"thread_id": job_id}}
+            checkpoints: list = list(self._checkpointer.list(config))
+            if not checkpoints:
+                return "Playbook executed successfully (no checkpoint recorded)."
+
+            # Most-recent checkpoint is first (SqliteSaver orders by checkpoint ID desc)
+            # BUG-C FIX: use .checkpoint["channel_values"], not .values
+            channel_values: dict = checkpoints[0].checkpoint.get("channel_values", {})
+
+            # Search node result keys for a `summary` field (written by llm_summarize action)
+            summaries = [
+                v["summary"]
+                for k, v in channel_values.items()
+                if k.startswith("node_") and isinstance(v, dict) and "summary" in v
+            ]
             if summaries:
                 return summaries[-1]
+
             return (
-                f"Completed {len(node_results)} nodes. "
-                f"Final state keys: {list(last.keys())}"
+                f"Completed {len(checkpoints)} checkpoint(s). "
+                f"Final state keys: {list(channel_values.keys())}"
             )
         except Exception as exc:
-            logger.warning(f"Could not summarise job {job_id}: {exc}")
+            logger.warning("Could not summarise job %s: %s", job_id, exc)
             return "Playbook completed — summary unavailable."
 
     # ── Query APIs ────────────────────────────────────────────────────────────
 
     def get_job(self, job_id: str) -> JobRecord | None:
-        cursor = self._conn.cursor()
-        cursor.execute("SELECT * FROM sno_jobs WHERE job_id = ?", (job_id,))
-        row = cursor.fetchone()
+        row = self._conn.execute(
+            "SELECT * FROM sno_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
         if not row:
             return None
-        
         record = JobRecord(
-            job_id=row[0],
-            playbook_id=row[1],
-            status=JobStatus(row[2]),
-            created_at=row[3],
-            started_at=row[4],
-            finished_at=row[5],
-            result=row[6] or "",
-            error=row[7] or "",
-            node_count=row[8],
-            completed_nodes=row[9],
+            job_id=row[0], playbook_id=row[1], status=JobStatus(row[2]),
+            created_at=row[3], started_at=row[4], finished_at=row[5],
+            result=row[6] or "", error=row[7] or "",
+            node_count=row[8], completed_nodes=row[9],
         )
         record._task = self._active_tasks.get(row[0])
         return record
 
     def get_all_jobs(self, limit: int = 100) -> list[dict]:
         """Return most-recent jobs first, capped at `limit`."""
-        cursor = self._conn.cursor()
-        cursor.execute("SELECT * FROM sno_jobs ORDER BY created_at DESC LIMIT ?", (limit,))
-        rows = cursor.fetchall()
-        jobs = []
+        rows = self._conn.execute(
+            "SELECT * FROM sno_jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        result = []
         for row in rows:
             record = JobRecord(
-                job_id=row[0],
-                playbook_id=row[1],
-                status=JobStatus(row[2]),
-                created_at=row[3],
-                started_at=row[4],
-                finished_at=row[5],
-                result=row[6] or "",
-                error=row[7] or "",
-                node_count=row[8],
-                completed_nodes=row[9],
+                job_id=row[0], playbook_id=row[1], status=JobStatus(row[2]),
+                created_at=row[3], started_at=row[4], finished_at=row[5],
+                result=row[6] or "", error=row[7] or "",
+                node_count=row[8], completed_nodes=row[9],
             )
-            jobs.append(record.to_dict())
-        return jobs
+            result.append(record.to_dict())
+        return result
+
+    def count_jobs(self) -> int:
+        """Return total number of jobs tracked in the DB."""
+        row = self._conn.execute("SELECT COUNT(*) FROM sno_jobs").fetchone()
+        return row[0] if row else 0
 
     def cancel_job(self, job_id: str) -> bool:
-        """
-        Request cancellation of a running job.
-        Returns True if the cancellation was requested, False if job not found or not running.
-        """
-        cursor = self._conn.cursor()
-        cursor.execute("SELECT status FROM sno_jobs WHERE job_id = ?", (job_id,))
-        row = cursor.fetchone()
+        """Cancel a running job. Returns True if cancellation was requested."""
+        row = self._conn.execute(
+            "SELECT status FROM sno_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
         if not row or row[0] != JobStatus.RUNNING.value:
             return False
-        
         task = self._active_tasks.get(job_id)
         if task and not task.done():
             task.cancel()
-            logger.info(f"Cancellation requested for job {job_id}")
-            return True
+            logger.info("Cancellation requested for job %s.", job_id)
         else:
-            self._update_job_in_db(job_id, status=JobStatus.CANCELLED, finished_at=time.time())
-            logger.info(f"Job {job_id} cancelled via DB state (running in another instance)")
-            return True
+            self._update_job(job_id, status=JobStatus.CANCELLED, finished_at=time.time())
+        return True
 
     def list_playbooks(self) -> list[dict]:
         """List available playbooks from the playbooks directory."""
@@ -451,18 +525,20 @@ class SNOExecutor:
         for path in sorted(self._playbooks_dir.glob("*.yaml")):
             try:
                 data = yaml.safe_load(path.read_text(encoding="utf-8"))
+                # Support both v1.x (playbook_id) and v2.0 (id) schema
+                pb_id = data.get("id") or data.get("playbook_id") or path.stem
                 result.append({
-                    "id": data.get("id", path.stem),
-                    "name": data.get("name", path.stem),
+                    "id": pb_id,
+                    "name": data.get("name", pb_id),
                     "description": data.get("description", ""),
                     "version": data.get("version", "1.0"),
                     "node_count": len(data.get("nodes", [])),
                 })
             except Exception as exc:
-                logger.warning(f"Could not parse playbook {path.name}: {exc}")
+                logger.warning("Could not parse playbook %s: %s", path.name, exc)
         return result
 
     def close(self) -> None:
-        """Clean up database connection."""
+        """Release the SQLite connection."""
         self._conn.close()
-        logger.info("SNOExecutor closed.")
+        logger.info("SNOExecutor closed.")
